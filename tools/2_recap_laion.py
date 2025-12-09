@@ -3,20 +3,9 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI 
+from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
-# import spacy 
-# from nltk.stem import WordNetLemmatizer
-# from nltk.corpus import words as nltk_words
-
-
-# nlp = spacy.load("en_core_web_sm")  
-# english_vocab = set(w.lower() for w in nltk_words.words())
-# lemmatizer = WordNetLemmatizer()
-gpt_model_name='gpt-4o_2024-11-20'
 
 
 prompt_format = (
@@ -37,84 +26,44 @@ prompt_format = (
     "Output: "
 )
 
-def is_english_word(word):
-    return word.lower() in english_vocab
-
-# Global lock for thread-safe file operations
-file_lock = Lock()
-
-# lemma_word = lemmatizer.lemmatize(i).lower()
-
-def filter_keywords(items, keywords):
-    return [item for item in items if item.lower() not in keywords]
-
-
 def extract_data_from_response(response):
     # Convert all double quotes to single quotes at the beginning
     response = response.replace('"', "'")
 
     # Regex to match the structure, supporting single quotes for keys and values
     background_pattern = r"'background'\s*:\s*\[(.*?)\]"
-    # subject_pattern = r"'subject'\s*:\s*\[(.*?)\]"
     object_pattern = r"'object'\s*:\s*\[(.*?)\]"
     summary_pattern = r"'summary'\s*:\s*\[(.*?)\]"
-    # Extracting background, subject, and object lists using regex
-    background_match = re.search(background_pattern, response)
-    # subject_match = re.search(subject_pattern, response)
-    object_match = re.search(object_pattern, response)
 
+    # Extracting background, object, and summary using regex
+    background_match = re.search(background_pattern, response)
+    object_match = re.search(object_pattern, response)
     summary_match = re.search(summary_pattern, response)
+
     # Initialize the result dictionary
     result = {"background": [], "object": [], "summary": []}
+
     if background_match:
         # Split and process background items
-        background_items = [item.strip("' ") for item in background_match.group(1).split("', '")]
-        # filtered_background_items = []
-        # tmp_set = set()
-        # for i in background_items:
-        #     doc = nlp(i)
-        #     is_valid_phrase = False
-        #     phrase = []
-        #     for token in doc:
-                
-        #         if token.pos_ == 'NOUN' or 'PROPN' and token.ent_type_ != 'PERSON' and is_english_word(token.text):
-        #             lemma = token.lemma_.lower()
-        #             phrase.append(lemma)
-        #             if lemma not in tmp_set and is_valid_phrase is False:
-        #                 is_valid_phrase = True
-        #                 tmp_set.add(lemma)
-        #         else:
-        #             phrase.append(token)
-        #     if is_valid_phrase:
-        #         filtered_background_items.append(" ".join(phrase).strip())
-        result["background"] = background_items
-    
+        background_str = background_match.group(1).strip()
+        if background_str:
+            background_items = [item.strip("' \"") for item in background_str.split("', '")]
+            result["background"] = background_items
+
     if object_match:
         # Split and process object items
-        object_items = [item.strip("' ") for item in object_match.group(1).split("', '")]
-        # filtered_object_items = []
-        # tmp_set = set()
-        # for i in object_items:
-        #     doc = nlp(i)
-        #     is_valid_phrase = False
-        #     phrase = []
-        #     for token in doc:
-                
-        #         if token.pos_ == 'NOUN' or 'PROPN' and token.ent_type_ != 'PERSON' and is_english_word(token.text):
-        #             lemma = token.lemma_.lower()
-        #             phrase.append(lemma)
-        #             if lemma not in tmp_set and is_valid_phrase is False:
-        #                 is_valid_phrase = True
-        #                 tmp_set.add(lemma)
-        #         else:
-        #             phrase.append(token)
-        #     if is_valid_phrase:
-        #         filtered_object_items.append(" ".join(phrase).strip())
-        result["object"] = object_items # filter_keywords(object_items, keywords_to_remove)
+        object_str = object_match.group(1).strip()
+        if object_str:
+            object_items = [item.strip("' \"") for item in object_str.split("', '")]
+            result["object"] = object_items
 
     if summary_match:
-        summary = summary_match.group(1).strip("' ")
-        result["summary"] = summary
+        # Process summary items (it's a list with one item)
+        summary_str = summary_match.group(1).strip()
+        if summary_str:
+            summary_items = [item.strip("' \"") for item in summary_str.split("', '")]
+            result["summary"] = summary_items
+
     # Check if all parts were successfully matched
     if background_match and object_match and summary_match:
         flag = True
@@ -125,11 +74,12 @@ def extract_data_from_response(response):
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(100))
-def call_gpt(
-    prompt, model_name=None, api_key=None, base_url=None
-):
-    model_name=gpt_model_name
-    chat_completion = aoiclient.chat.completions.create(
+def call_gpt(prompt, model_name, api_key, base_url):
+    client = OpenAI(
+        api_key=api_key or "dummy-key",  # vLLM通常不需要真实的API key
+        base_url=base_url
+    )
+    chat_completion = client.chat.completions.create(
         model=model_name,
         messages=[
             {
@@ -156,7 +106,7 @@ def process_file(json_data, model_name, api_key, base_url, output_folder):
     except json.JSONDecodeError:
         response_data, flag = extract_data_from_response(response)
         if not flag:
-            print("The response fis not in JSON format, skipping.")
+            print(f"The response is not in valid format, skipping. Key: {key}")
             return
 
     image_metadata["tags"] = response_data
@@ -174,6 +124,9 @@ def parse_args():
         "--output_json_folder", type=str, required=True, help="Path to the output json folder."
     )
     parser.add_argument("--num_worker", type=int, default=32, help="Number of threads for parallel processing")
+    parser.add_argument("--base_url", type=str, required=True, help="Base URL for vLLM service (e.g., http://localhost:8000/v1)")
+    parser.add_argument("--model_name", type=str, required=True, help="Model name for vLLM service")
+    parser.add_argument("--api_key", type=str, default="dummy-key", help="API key (usually not needed for local vLLM)")
 
     return parser.parse_args()
 
@@ -185,17 +138,12 @@ if __name__ == "__main__":
     num_worker = args.num_worker
     input_json = args.input_json
     output_folder = args.output_json_folder
-
-    # model_name = args.model_name
-    # api_key = args.api_key
-    # base_url = args.base_url
+    model_name = args.model_name
+    api_key = args.api_key
+    base_url = args.base_url
 
     with open(input_json, 'r', encoding="utf-8") as f:
         data = json.load(f)
-
-    model_name = None
-    api_key = None
-    base_url = None
 
     os.makedirs(output_folder, exist_ok=True)
 
