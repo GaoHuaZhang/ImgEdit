@@ -21,7 +21,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 import warnings
 warnings.filterwarnings('ignore')
 
-sys.path.append('model_zoo/YOLO-World')  
+sys.path.append('model_zoo/YOLO-World')
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -276,6 +276,20 @@ def post_process_all(
             else:
                 raise NotImplementedError
 
+        # 统计每个类别的数量
+        bg_count = {}
+        for ann in results["background"]:
+            class_name = ann["class_name"]
+            bg_count[class_name] = bg_count.get(class_name, 0) + 1
+
+        obj_count = {}
+        for ann in results["object"]:
+            class_name = ann["class_name"]
+            obj_count[class_name] = obj_count.get(class_name, 0) + 1
+
+        # 添加计数到结果中
+        results["bg_count"] = bg_count
+        results["obj_count"] = obj_count
 
         if dump_json_results:
             return results
@@ -301,9 +315,9 @@ def parse_args():
         help="Path to the folder containing JSON files.",
     )
     parser.add_argument(
-        "--image_folder", 
+        "--image_folder",
         required=True,
-        type=str, 
+        type=str,
         help="Path to the input image",
     )
     parser.add_argument(
@@ -401,7 +415,7 @@ if __name__ == "__main__":
     dump_json_results = args.dump_json_results
     split_nums = args.split_nums
     part = args.part
-    
+
     os.makedirs(output_path, exist_ok=True)
 
     json_files = [
@@ -416,7 +430,7 @@ if __name__ == "__main__":
     Load YoloWorld
     """
 
-    
+
     cfg = Config.fromfile(args.yolo_config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
@@ -424,7 +438,7 @@ if __name__ == "__main__":
     cfg.work_dir = os.path.join("./work_dirs", os.path.splitext(os.path.basename(args.yolo_config))[0])
     # init model
     cfg.load_from = args.yolo_checkpoint
-    
+
     yolo_model = init_detector(cfg, checkpoint=args.yolo_checkpoint, device=args.device)
 
     # init test pipeline
@@ -436,7 +450,7 @@ if __name__ == "__main__":
     Load SAM2.1
     """
     sam_model = SAM2ImagePredictor(build_sam2(sam_model_cfg, sam_checkpoint))
-    
+
     """
     Main Loop DataLoader
         {
@@ -452,7 +466,7 @@ if __name__ == "__main__":
     # yang modified
     dataset = ImageDataset(json_files, image_folder, output_path)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, prefetch_factor=4, pin_memory=True, collate_fn=custom_collate_fn)
-    
+
     for batch in tqdm(dataloader, desc="Processing Files", total=len(dataloader)):
         batch = batch[0]
         img_name = batch["img_name"]
@@ -501,7 +515,18 @@ if __name__ == "__main__":
         )
 
         output_json_file = os.path.basename(json_file).replace(".json", "_step4.json")
+
+        # 提取计数信息（如果存在）
+        bg_count = result.pop("bg_count", {})
+        obj_count = result.pop("obj_count", {})
+
+        # 将 segmentation 结果添加到 raw_data
         raw_data["segmentation"] = result
+
+        # 将计数信息作为顶级字段添加
+        raw_data["bg_count"] = bg_count
+        raw_data["obj_count"] = obj_count
+
         output_json_path = os.path.join(output_path, output_json_file)
         with open(output_json_path, "w") as f:
             json.dump(raw_data, f, indent=4)
