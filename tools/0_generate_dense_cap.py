@@ -79,7 +79,7 @@ def make_payload(model: str, image_b64: str, mime_type: str, instruction: str, m
             "role": "user",
             "content": [
                 {"type": "text", "text": instruction},
-                {"type": "image", "image": {"b64": image_b64, "mime_type": mime_type}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
             ],
         }
     ]

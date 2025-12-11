@@ -287,6 +287,29 @@ def execute_edit_tasks(
     print(f"JSON目录: {json_dir}")
     print(f"结果目录: {result_dir}")
 
+    # 检查环境变量
+    env_vars = {
+        "RANK": os.environ.get("RANK", "0"),
+        "MASTER_ADDR": os.environ.get("MASTER_ADDR", "localhost"),
+        "MASTER_PORT": os.environ.get("MASTER_PORT", "12345"),
+        "WORLD_SIZE": os.environ.get("WORLD_SIZE", "1"),
+        "PYTHONPATH": os.environ.get("PYTHONPATH", sys.executable),
+        "COMFYUI_PATH": os.environ.get("COMFYUI_PATH", ""),
+    }
+
+    # 如果没有设置 WORLD_SIZE 或设置为 1，使用单机模式
+    world_size = int(env_vars.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        print(f"提示: 使用单机模式 (WORLD_SIZE=1)")
+        print(f"提示: 确保 ComfyUI 服务已在本地运行（端口 8180+）")
+    else:
+        print(f"提示: 使用分布式模式 (WORLD_SIZE={world_size})")
+        print(f"提示: 确保所有 worker 节点已启动 register_worker.py")
+
+    print(f"环境变量:")
+    for key, value in env_vars.items():
+        print(f"  {key}={value}")
+
     try:
         # 切换到workflow目录执行
         # 注意：这些脚本使用dlc_context_runner，需要设置相应的环境变量
@@ -298,11 +321,13 @@ def execute_edit_tasks(
             cwd=workflow_dir,
             check=True,
             capture_output=False,
+            env=dict(os.environ, **{k: str(v) for k, v in env_vars.items() if v}),
         )
         print(f"✓ 编辑类型 {edit_type} 处理完成")
     except subprocess.CalledProcessError as e:
         print(f"✗ 执行失败: {e}")
         print(f"提示: 请确保已设置必要的环境变量（RANK, MASTER_ADDR, MASTER_PORT等）")
+        print(f"提示: 单机模式需要确保 ComfyUI 服务正在运行")
         raise
     finally:
         # 清理创建的符号链接
