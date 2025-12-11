@@ -46,42 +46,44 @@ import os
 import sys
 import argparse
 import glob
+import re
+import tempfile
 from pathlib import Path
 from typing import Dict, List
 import subprocess
 from tqdm import tqdm
 
-# 编辑类型到脚本的映射
+# 编辑类型到脚本的映射（.sh 脚本）
 EDIT_TYPE_TO_SCRIPT = {
-    "add": "dlc_add.py",
-    "remove": "dlc_remove.py",
-    "replace": "dlc_replace.py",
-    "adjust": "dlc_adjust_canny.py",
-    "background": "dlc_background_change.py",
-    "extract": "dlc_extract_ref.py",
+    "add": "dlc_add.sh",
+    "remove": "dlc_remove.sh",
+    "replace": "dlc_replace.sh",
+    "adjust": "dlc_adjust_canny.sh",
+    "background": "dlc_background_change.sh",
+    "extract": "dlc_extract_ref.sh",
     # 混合编辑类型
     "hybrid": {
-        "add": "dlc_compose_add.py",
-        "remove": "dlc_compose_remove.py",
-        "replace": "dlc_compose_replace.py",
-        "adjust": "dlc_compose_adjust.py",
+        "add": "dlc_compose_add.sh",
+        "remove": "dlc_compose_remove.sh",
+        "replace": "dlc_compose_replace.sh",
+        "adjust": "dlc_compose_adjust.sh",
     },
     # 多轮编辑类型
     "content_memory": {
-        "add": "dlc_compose_add_omit.py",
-        "remove": "dlc_compose_remove_omit.py",
-        "replace": "dlc_compose_replace_omit.py",
-        "adjust": "dlc_compose_adjust_omit.py",
+        "add": "dlc_compose_add_omit.sh",
+        "remove": "dlc_compose_remove_omit.sh",
+        "replace": "dlc_compose_replace_omit.sh",
+        "adjust": "dlc_compose_adjust_omit.sh",
     },
     "content_understand": {
-        "add": "dlc_compose_add_omit.py",
-        "remove": "dlc_compose_remove_omit.py",
-        "replace": "dlc_compose_replace_omit.py",
-        "adjust": "dlc_compose_adjust_omit.py",
+        "add": "dlc_compose_add_omit.sh",
+        "remove": "dlc_compose_remove_omit.sh",
+        "replace": "dlc_compose_replace_omit.sh",
+        "adjust": "dlc_compose_adjust_omit.sh",
     },
     "version_backtrack": {
-        "replace": "dlc_compose_replace_version.py",
-        "adjust": "dlc_compose_adjust_version.py",
+        "replace": "dlc_compose_replace_version.sh",
+        "adjust": "dlc_compose_adjust_version.sh",
     },
 }
 
@@ -269,23 +271,60 @@ def execute_edit_tasks(
         # 找到所有JSON文件的公共父目录
         json_dir = os.path.commonpath([os.path.dirname(f) for f in json_files])
 
-    # 构建命令参数
-    cmd_args = [
-        "--json_dir", json_dir,
-        "--base_img_dir", base_img_dir,
-        "--result_dir", result_dir,
+    # 读取原始 .sh 脚本
+    try:
+        with open(script_path, 'r', encoding='utf-8') as f:
+            script_content = f.read()
+    except Exception as e:
+        print(f"错误: 无法读取脚本 {script_path}: {e}")
+        return
+
+    # 构建 TASK_KWARGS 参数
+    task_kwargs_parts = [
+        f"--json_dir {json_dir}",
+        f"--base_img_dir {base_img_dir}",
+        f"--result_dir {result_dir}",
     ]
 
     # 添加task_type参数（如果需要）
     if task_type:
-        cmd_args.extend(["--task_type", task_type])
+        task_kwargs_parts.append(f"--task_type {task_type}")
 
-    # 构建完整命令
-    cmd = [sys.executable, script_path] + cmd_args
+    task_kwargs = " ".join(task_kwargs_parts)
 
-    print(f"执行命令: {' '.join(cmd)}")
+    # 替换脚本中的 TASK_KWARGS
+    # 查找 TASK_KWARGS="..." 这一行并替换
+    import re
+    pattern = r'TASK_KWARGS="[^"]*"'
+    replacement = f'TASK_KWARGS="{task_kwargs}"'
+    modified_script = re.sub(pattern, replacement, script_content)
+
+    # 如果替换失败（可能格式不同），尝试在 TASK_KWARGS= 之后添加
+    if modified_script == script_content:
+        # 查找 TASK_KWARGS= 行并替换整行
+        pattern = r'TASK_KWARGS=.*'
+        replacement = f'TASK_KWARGS="{task_kwargs}"'
+        modified_script = re.sub(pattern, replacement, script_content, flags=re.MULTILINE)
+
+    # 创建临时脚本文件
+    import tempfile
+    temp_script = tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.sh',
+        dir=workflow_dir,
+        delete=False
+    )
+    temp_script.write(modified_script)
+    temp_script.close()
+    temp_script_path = temp_script.name
+
+    # 设置执行权限
+    os.chmod(temp_script_path, 0o755)
+
+    print(f"执行脚本: {os.path.basename(script_path)}")
     print(f"JSON目录: {json_dir}")
     print(f"结果目录: {result_dir}")
+    print(f"任务参数: {task_kwargs}")
 
     # 检查环境变量
     env_vars = {
@@ -311,13 +350,13 @@ def execute_edit_tasks(
         print(f"  {key}={value}")
 
     try:
-        # 切换到workflow目录执行
+        # 执行 .sh 脚本
         # 注意：这些脚本使用dlc_context_runner，需要设置相应的环境变量
         # 如果使用DLC，需要确保以下环境变量已设置：
         # - RANK, MASTER_ADDR, MASTER_PORT, WORLD_SIZE
         # - PYTHONPATH, COMFYUI_PATH
         result = subprocess.run(
-            cmd,
+            ["bash", temp_script_path],
             cwd=workflow_dir,
             check=True,
             capture_output=False,
@@ -330,6 +369,13 @@ def execute_edit_tasks(
         print(f"提示: 单机模式需要确保 ComfyUI 服务正在运行")
         raise
     finally:
+        # 清理临时脚本
+        try:
+            if 'temp_script_path' in locals() and os.path.exists(temp_script_path):
+                os.unlink(temp_script_path)
+        except Exception as e:
+            print(f"警告: 无法删除临时脚本 {temp_script_path}: {e}")
+
         # 清理创建的符号链接
         for link_path in created_links:
             try:
