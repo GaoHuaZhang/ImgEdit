@@ -4,17 +4,15 @@ import os
 import re
 from tqdm import tqdm
 import argparse
-from openai import AzureOpenAI 
 from tenacity import retry, stop_after_attempt, wait_exponential
 import logging
 from openai import OpenAI
 from termcolor import colored
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 import math
 
 edit_type = [
-    "add", 
+    "add",
     "remove",
     "replace",
     "adjust",
@@ -26,10 +24,7 @@ edit_type = [
     "version_backtrack",
 ]
 
-client = OpenAI(
-            api_key="your api-key",
-            base_url=""
-        )
+# Client will be initialized in main()
 
 version_backtrack_prompt = (
 "Act as a data annotator who creates multi-turn image-editing prompts from a given scene, three instructions, and one object. Instruction keywords: add - insert the specified object as if it is not yet present, replace - swap the specified object with another one, adjust - modify the object's attributes (color, material, texture, appearance). Prompt should blend naturally into the scene. Workflow: You need to generate three round prompts based on the given instructions and the specific object, The first round is always 'add',  discribe more detail and provide an approximate description of the object's position and size according to its bounding box coordinates and image resolution. Do not use additional sentences to describe the position!!!. The second prompt is 'replace'. In the third round, your prompt should reject the edits from the previous round and, based on the first round, generate a new “adjust” prompt. For example: "
@@ -124,11 +119,9 @@ hybrid_prompt = (
 clever_model_name='gpt-4o_2024-11-20'
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(100))
-def call_gpt(
-    prompt, model_name=None, api_key=None, base_url=None
-):
+def call_gpt(prompt, client, model_name):
     chat_completion = client.chat.completions.create(
-        model="gpt-4o",
+        model=model_name,
         messages=[
             {
                 "role": "user",
@@ -169,26 +162,28 @@ def parse_args():
         "--model",
         required=True,
         type=str,
-        help="gpt model name.",
+        help="Model name for vLLM service.",
     )
     parser.add_argument(
-        "--output_path", 
+        "--output_path",
         required=True,
-        type=str, 
+        type=str,
         help="Path to the output JSON files.",
     )
     parser.add_argument("--instruction-type", default='mix',
                         choices=['mix'] + edit_type, help="specify the experiment id.")
     parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1", help="vLLM service base URL")
+    parser.add_argument("--api_key", type=str, default="EMPTY", help="API key for vLLM service (default: EMPTY)")
     args = parser.parse_args()
     return args
 
 # replace_adjust_pattern = r"^prompt:\s*'(.*?)',?\s*result:\s*'(.*?)'\s*$"
-replace_adjust_pattern = r"^prompt:\s*(.*?),?\s*result:\s*(.*?)\s*$"  
-hybrid_pattern = r"^prompt:\s*(.*?),?\s*result1:\s*(.*?),?\s*result2:\s*(.*?)\s*$"  
+replace_adjust_pattern = r"^prompt:\s*(.*?),?\s*result:\s*(.*?)\s*$"
+hybrid_pattern = r"^prompt:\s*(.*?),?\s*result1:\s*(.*?),?\s*result2:\s*(.*?)\s*$"
 add_remove_pattern = r"'(.*?)'|(.+)"
-content_memory_pattern = r"^premise:\s*(.*?),?\s*round1:\s*(.*?),?\s*result1:\s*(.*?),?\s*round2:\s*(.*?),?\s*result2:\s*(.*?)\s*$" 
-content_understand_pattern = r"^round1:\s*(.*?),?\s*round2:\s*(.*?),?\s*result2:\s*(.*?),?\s*round3:\s*(.*?),?\s*result3:\s*(.*?)\s*$" 
+content_memory_pattern = r"^premise:\s*(.*?),?\s*round1:\s*(.*?),?\s*result1:\s*(.*?),?\s*round2:\s*(.*?),?\s*result2:\s*(.*?)\s*$"
+content_understand_pattern = r"^round1:\s*(.*?),?\s*round2:\s*(.*?),?\s*result2:\s*(.*?),?\s*round3:\s*(.*?),?\s*result3:\s*(.*?)\s*$"
 def valid_obj_candidate(obbox, area, score, clip_score, a_threshold, s_threshold, c_threshold):
     if isinstance(score, list):
         if len(score) > 1 or len(score) == 0:
@@ -221,116 +216,116 @@ def valid_bg_candidate(obbox, area, score, clip_score, a_threshold, s_threshold,
         return True
     return False
 
-def make_replace_adjust_description(summary, object, resolution, bbox):  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    # 格式化 bbox 信息，四舍五入为整数  
-    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"  
-    # 构建描述字符串  
-    description = (  
-        f"summary: {summary}, "  
-        f"object: '{object}', "  
-        f"resolution: {resolution_str}, object bbox: {bbox_str}."  
-    )  
-    return description 
+def make_replace_adjust_description(summary, object, resolution, bbox):
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    # 格式化 bbox 信息，四舍五入为整数
+    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"
+    # 构建描述字符串
+    description = (
+        f"summary: {summary}, "
+        f"object: '{object}', "
+        f"resolution: {resolution_str}, object bbox: {bbox_str}."
+    )
+    return description
 
-def make_bg_description(summary, background, object, count=5):  
-    selected_object = object if len(object) < count else random.sample(object, count)  
-      
-    # 构建描述字符串  
-    description = (  
-        f"summary: {summary}, "  
-        f"background: '{background}'"  
-        f"object in background: '{', '.join(selected_object)}'."  
-    )  
-    return description 
+def make_bg_description(summary, background, object, count=5):
+    selected_object = object if len(object) < count else random.sample(object, count)
 
-def make_content_understand_description(caption, object, bbox, resolution, instruction):  
-    # 格式化 resolution 信息  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    # 格式化 bbox 信息，四舍五入为整数  
-    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"  
-    # 构建描述字符串  
-    desp = f"caption: {caption}, resolution: {resolution_str}, object: '{object}', object bbox: {bbox_str}, instructions: {instruction}"  
-    return desp  
+    # 构建描述字符串
+    description = (
+        f"summary: {summary}, "
+        f"background: '{background}'"
+        f"object in background: '{', '.join(selected_object)}'."
+    )
+    return description
 
-def make_version_backtrack_description(caption, object, bbox, resolution, instruction):  
-    # 格式化 resolution 信息  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    # 格式化 bbox 信息，四舍五入为整数  
-    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"  
-    # 构建描述字符串  
-    desp = f"caption: {caption}, resolution: {resolution_str}, object: '{object}', object bbox: {bbox_str}, instructions: {instruction}"  
-    return desp 
+def make_content_understand_description(caption, object, bbox, resolution, instruction):
+    # 格式化 resolution 信息
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    # 格式化 bbox 信息，四舍五入为整数
+    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"
+    # 构建描述字符串
+    desp = f"caption: {caption}, resolution: {resolution_str}, object: '{object}', object bbox: {bbox_str}, instructions: {instruction}"
+    return desp
 
-
-def make_add_description(caption, object, bbox, resolution):  
-    # 格式化 resolution 信息  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    # 格式化 bbox 信息，四舍五入为整数  
-    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"  
-    # 构建描述字符串  
-    desp = f"caption: {caption} object: '{object}', resolution: {resolution_str}, object bbox: {bbox_str}."  
-    return desp  
-
-def make_remove_description(caption, object, bbox, resolution):  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    if bbox is not None:
-        bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"  
-        desp = f"caption: {caption} object to remove: '{object}', resolution: {resolution_str}, object bbox: {bbox_str}"  
-    else:
-        desp = f"caption: {caption} object to remove: '{object}'."  
+def make_version_backtrack_description(caption, object, bbox, resolution, instruction):
+    # 格式化 resolution 信息
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    # 格式化 bbox 信息，四舍五入为整数
+    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"
+    # 构建描述字符串
+    desp = f"caption: {caption}, resolution: {resolution_str}, object: '{object}', object bbox: {bbox_str}, instructions: {instruction}"
     return desp
 
 
-def make_hybrid_description(caption, object1, object2, bbox1, bbox2, instruct, resolution):  
-    # 格式化 resolution 信息  
-    resolution_str = f"{resolution['height']}x{resolution['width']}"  
-    # 格式化 bbox 信息，四舍五入为整数  
+def make_add_description(caption, object, bbox, resolution):
+    # 格式化 resolution 信息
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    # 格式化 bbox 信息，四舍五入为整数
+    bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"
+    # 构建描述字符串
+    desp = f"caption: {caption} object: '{object}', resolution: {resolution_str}, object bbox: {bbox_str}."
+    return desp
+
+def make_remove_description(caption, object, bbox, resolution):
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    if bbox is not None:
+        bbox_str = f"[{int(round(bbox[0]))},{int(round(bbox[1]))},{int(round(bbox[2]))},{int(round(bbox[3]))}]"
+        desp = f"caption: {caption} object to remove: '{object}', resolution: {resolution_str}, object bbox: {bbox_str}"
+    else:
+        desp = f"caption: {caption} object to remove: '{object}'."
+    return desp
+
+
+def make_hybrid_description(caption, object1, object2, bbox1, bbox2, instruct, resolution):
+    # 格式化 resolution 信息
+    resolution_str = f"{resolution['height']}x{resolution['width']}"
+    # 格式化 bbox 信息，四舍五入为整数
     bbox_str1 = f"[{int(round(bbox1[0]))},{int(round(bbox1[1]))},{int(round(bbox1[2]))},{int(round(bbox1[3]))}]"
     bbox_str2 = f"[{int(round(bbox2[0]))},{int(round(bbox2[1]))},{int(round(bbox2[2]))},{int(round(bbox2[3]))}]"
 
-    # 构建描述字符串  
-    desp = f"sence: {caption}, resolution: {resolution_str}, object1: '{object1}', bbox1: {bbox_str1}, instruction1: '{instruct[0]}', object2: '{object2}', bbox2: {bbox_str2}, instruction2: '{instruct[1]}'."  
-    return desp 
- 
-def make_content_memory_description(caption, object1, object2, instruct):  
-    # 构建描述字符串  
-    desp = f"sence: {caption}, object1: '{object1}', instruction1: '{instruct[0]}', object2: '{object2}', instruction2: '{instruct[1]}'."  
-    return desp 
-    
-def bbox_far_enough(box1, box2, min_dist=100, xywh=False):  
-    # 统一坐标  
+    # 构建描述字符串
+    desp = f"sence: {caption}, resolution: {resolution_str}, object1: '{object1}', bbox1: {bbox_str1}, instruction1: '{instruct[0]}', object2: '{object2}', bbox2: {bbox_str2}, instruction2: '{instruct[1]}'."
+    return desp
+
+def make_content_memory_description(caption, object1, object2, instruct):
+    # 构建描述字符串
+    desp = f"sence: {caption}, object1: '{object1}', instruction1: '{instruct[0]}', object2: '{object2}', instruction2: '{instruct[1]}'."
+    return desp
+
+def bbox_far_enough(box1, box2, min_dist=100, xywh=False):
+    # 统一坐标
     x1_1, y1_1, x2_1, y2_1 =  box1
     x1_2, y1_2, x2_2, y2_2 = box2
-  
-    # 1) 判是否重叠  
-    overlap = not (x2_1 < x1_2 or x2_2 < x1_1 or  
-                   y2_1 < y1_2 or y2_2 < y1_1)  
-    if overlap:  
-        return False          # 有重叠，直接返回不符合要求  
-  
-    # 2) 计算最近距离  
-    dx = 0.0  
-    if x2_1 < x1_2:          # box1 在左边  
-        dx = x1_2 - x2_1  
-    elif x2_2 < x1_1:        # box2 在左边  
-        dx = x1_1 - x2_2  
-  
-    dy = 0.0  
-    if y2_1 < y1_2:          # box1 在上面  
-        dy = y1_2 - y2_1  
-    elif y2_2 < y1_1:        # box2 在上面  
-        dy = y1_1 - y2_2  
-  
-    dist = math.hypot(dx, dy)  # √(dx²+dy²)  
-    return dist > min_dist  
 
-def caption(batch):
+    # 1) 判是否重叠
+    overlap = not (x2_1 < x1_2 or x2_2 < x1_1 or
+                   y2_1 < y1_2 or y2_2 < y1_1)
+    if overlap:
+        return False          # 有重叠，直接返回不符合要求
+
+    # 2) 计算最近距离
+    dx = 0.0
+    if x2_1 < x1_2:          # box1 在左边
+        dx = x1_2 - x2_1
+    elif x2_2 < x1_1:        # box2 在左边
+        dx = x1_1 - x2_2
+
+    dy = 0.0
+    if y2_1 < y1_2:          # box1 在上面
+        dy = y1_2 - y2_1
+    elif y2_2 < y1_1:        # box2 在上面
+        dy = y1_1 - y2_2
+
+    dist = math.hypot(dx, dy)  # √(dx²+dy²)
+    return dist > min_dist
+
+def caption(batch, client, model_name, output_path):
     filename = batch["filename"]
     resolution = (batch['resolution']['height'], batch['resolution']['width'])
     img_area = resolution[0] * resolution[1]
 
-    output_dir = os.path.join(args.output_path, os.path.basename(filename).replace("_step4_withcount.json", ""))  
+    output_dir = os.path.join(output_path, os.path.basename(filename).replace("_step4_withcount.json", ""))
 
     # if os.path.exists(output_json_path):
     #     return
@@ -342,7 +337,7 @@ def caption(batch):
                 bbox = bg_list[i]['bbox']
                 score = bg_list[i]['score']
                 clip_score = bg_list[i]['clip_score']
-                if valid_bg_candidate(bbox, img_area, score, clip_score, a_threshold=0.4, s_threshold=0.75, c_threshold=0.7): 
+                if valid_bg_candidate(bbox, img_area, score, clip_score, a_threshold=0.4, s_threshold=0.75, c_threshold=0.7):
                     candidate.append(i)
             if len(candidate) == 0:
                 logging.warning(f"No candidate object for editing")
@@ -359,7 +354,7 @@ def caption(batch):
                 bbox = obj_list[i]['bbox']
                 score = obj_list[i]['score']
                 clip_score = obj_list[i]['clip_score']
-                if valid_obj_candidate(bbox, img_area, score, clip_score, a_threshold=0.08, s_threshold=0.8, c_threshold=0.8): 
+                if valid_obj_candidate(bbox, img_area, score, clip_score, a_threshold=0.08, s_threshold=0.8, c_threshold=0.8):
                     candidate.append(i)
 
             if len(candidate) == 0:
@@ -370,7 +365,7 @@ def caption(batch):
                 if len(candidate) <= 1:
                     logging.warning(f"No candidate object for editing")
                     break
-                edit_obj = [batch['segmentation']['object'][i] for i in random.sample(candidate, 2)]  
+                edit_obj = [batch['segmentation']['object'][i] for i in random.sample(candidate, 2)]
                 if edit_obj[1]['class_name'] == edit_obj[0]['class_name']:
                     break
                 if not bbox_far_enough(edit_obj[0]['bbox'],edit_obj[1]['bbox']):
@@ -385,25 +380,25 @@ def caption(batch):
                 if len(candidate) <= 1:
                     logging.warning(f"No candidate object for editing")
                     break
-                edit_obj = [batch['segmentation']['object'][i] for i in random.sample(candidate, 2)]  
+                edit_obj = [batch['segmentation']['object'][i] for i in random.sample(candidate, 2)]
                 # edit_obj = batch['segmentation']['object'][random.sample(candidate, 2)]
                 instructions = random.choices(["replace", "adjust"], k=2)
                 desp = make_content_memory_description(batch['tags']["summary"], edit_obj[0]['class_name'], edit_obj[1]['class_name'], instructions)
                 input_prompt = content_memory_prompt.replace("{{{}}}", desp).replace("\t", "").strip()
                 model_name = clever_model_name
-            
+
             if instruction_type == 'content_understand':
-                edit_obj = batch['segmentation']['object'][random.choice(candidate)] 
+                edit_obj = batch['segmentation']['object'][random.choice(candidate)]
                 # edit_obj = batch['segmentation']['object'][random.sample(candidate, 2)]
-                instructions = random.choice([  
-                    ['add', 'adjust', 'remove'],  
-                    ['add', 'adjust', 'replace']  
+                instructions = random.choice([
+                    ['add', 'adjust', 'remove'],
+                    ['add', 'adjust', 'replace']
                 ])
                 desp = make_content_understand_description(batch['cap'][0], edit_obj['class_name'], edit_obj['bbox'], batch['resolution'], instructions)
                 input_prompt = content_understand_prompt.replace("{{{}}}", desp).replace("\t", "").strip()
                 model_name = clever_model_name
             if instruction_type == 'version_backtrack':
-                edit_obj = batch['segmentation']['object'][random.choice(candidate)] 
+                edit_obj = batch['segmentation']['object'][random.choice(candidate)]
                 instructions = ['add', 'replace', 'adjust']
                 desp = make_version_backtrack_description(batch['cap'][0], edit_obj['class_name'], edit_obj['bbox'], batch['resolution'], instructions)
                 input_prompt = version_backtrack_prompt.replace("{{{}}}", desp).replace("\t", "").strip()
@@ -432,9 +427,9 @@ def caption(batch):
                 desp = make_replace_adjust_description(batch['tags']["summary"], edit_obj['class_name'], batch['resolution'], edit_obj['bbox'])
                 input_prompt = adjust_prompt.replace("{{{}}}", desp).replace("\n", "").replace("\t", "").strip()
                 model_name = clever_model_name
-        match = None       
+        match = None
         for attempt in range(3):
-            response = call_gpt(input_prompt, model_name=model_name).replace("\n", "").strip("` ").strip()
+            response = call_gpt(input_prompt, client, model_name).replace("\n", "").strip("` ").strip()
             if instruction_type in ["adjust", "replace", "background"]:
                 pattern = replace_adjust_pattern
                 match = re.match(pattern, response)
@@ -447,7 +442,7 @@ def caption(batch):
                         logging.warning(f"Attempt {attempt+1} failed")
                 except:
                     print(colored(response+"  match catch error", "red"))
-                    break 
+                    break
             elif instruction_type in ["content_understand", "version_backtrack"]:
                 # import pdb; pdb.set_trace()
                 pattern = content_understand_pattern
@@ -464,7 +459,7 @@ def caption(batch):
                         logging.warning(f"Attempt {attempt+1} failed")
                 except:
                     print(colored(response+"  match catch error", "red"))
-                    break 
+                    break
             elif instruction_type == "content_memory":
                 pattern = content_memory_pattern
                 match = re.match(pattern, response)
@@ -480,7 +475,7 @@ def caption(batch):
                         logging.warning(f"Attempt {attempt+1} failed")
                 except:
                     print(colored(response+"  match catch error", "red"))
-                    break 
+                    break
             elif instruction_type == "hybrid":
                 pattern = hybrid_pattern
                 match = re.match(pattern, response)
@@ -494,14 +489,14 @@ def caption(batch):
                         logging.warning(f"Attempt {attempt+1} failed")
                 except:
                     print(colored(response+"  match catch error", "red"))
-                    break 
+                    break
             elif instruction_type in ["add", "remove"]:
                 pattern = None
                 break
         if not match and pattern is not None:
             print(colored(response+"  Prompt generated failed", "blue"))
             break
-        # only need path edit_obj edit_type edit_prompt result 
+        # only need path edit_obj edit_type edit_prompt result
         if instruction_type == "add":
             data_info = {"original_path": batch['path'], "resolution": batch['resolution'], "edit_obj": None, "edit_type": instruction_type, "edit_prompt": response, "edit_result": edit_obj}
         elif instruction_type == "remove":
@@ -516,28 +511,31 @@ def caption(batch):
             data_info = {"original_path": batch['path'], "resolution": batch['resolution'], "edit_obj": edit_obj, "edit_type": instructions, "round1_prompt": round1, "round2_prompt": round2, "edit_result2": edit_result2, "round3_prompt": round3, "edit_result3": edit_result3}
         elif instruction_type == "version_backtrack":
             data_info = {"original_path": batch['path'], "resolution": batch['resolution'], "edit_obj": edit_obj, "edit_type": instructions, "round1_prompt": round1, "round2_prompt": round2, "edit_result2": edit_result2, "round3_prompt": round3, "edit_result3": edit_result3}
-         
-        os.makedirs(output_dir, exist_ok=True)  
+
+        os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, f"{instruction_type}.json"), "w") as f:
             json.dump(data_info, f, indent=4)
 
-    return  
+    return
 
-def process_file(json_file):
+def process_file(args):
+    json_file, base_url, api_key, model_name, output_path = args
+    # 在每个进程中创建client，因为client对象不能被pickle
+    client = OpenAI(api_key=api_key, base_url=base_url)
     try:
         with open(json_file, "r") as f:
             data = json.load(f)
         data["filename"] = json_file
-        caption(data)
+        caption(data, client, model_name, output_path)
         return json_file  # 返回成功处理的文件路径
     except Exception as e:
         logging.error(f"Error processing file {json_file}: {e}", exc_info=True)
         return None
-    
+
 if __name__ == '__main__':
     args = parse_args()
-    clever_model_name = args.model
-    
+    model_name = args.model
+
     os.makedirs(args.output_path, exist_ok=True)
 
     json_files = [
@@ -547,11 +545,12 @@ if __name__ == '__main__':
         and not os.path.exists(os.path.join(args.output_path, os.path.basename(f).replace("_step4_withcount.json", "")))
     ]
     results = []
-    # for json_file in json_files:
-    #     process_file(json_file)
 
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        future_to_file = {executor.submit(process_file, json_file): json_file for json_file in json_files}
+        future_to_file = {
+            executor.submit(process_file, (json_file, args.base_url, args.api_key, model_name, args.output_path)): json_file
+            for json_file in json_files
+        }
         for future in tqdm(as_completed(future_to_file), total=len(future_to_file), desc="Processing Files"):
             json_file = future_to_file[future]
             try:
@@ -562,21 +561,21 @@ if __name__ == '__main__':
                     logging.warning(f"Failed to process file: {json_file}")
             except Exception as exc:
                 logging.error(f"File {json_file} generated an exception: {exc}", exc_info=True)
-    
+
     logging.info("Processing complete.")
 
 
-                
+
 
 
         # elif instruction_type == "textual":
         #     pass
         # else:
         #     raise NotImplementedError
-            
 
-         
-           
+
+
+
 
 
 # summary: 'A sleek smartphone lying on a wooden desk next to a laptop.' object: 'smartphone', resolution: 1920x1080, bbox: [1200,600,1850,1000] Output: prompt: replace smartphone positioned in the bottom-right quadrant of the image with a camera, result: a camera.

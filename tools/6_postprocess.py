@@ -5,17 +5,7 @@ import argparse
 from multiprocessing import Pool
 from tqdm import tqdm
 from openai import OpenAI
-
-
-
-from openai import AzureOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-from tqdm import tqdm
-
-client = OpenAI(
-            api_key="your api-key",
-            base_url="your base-url"
-        )
 
 prompt = """
 You are a data rater specializing in grading image editing tasks. You will be given two images (before and after editing) and the corresponding editing instructions. Your task is to evaluate the editing effect on a 5-point scale from two perspectives:
@@ -58,7 +48,7 @@ def image_to_base64(image_path):
 
 # Retry decorator with exponential backoff for call_gpt
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(100))
-def call_gpt(original_image_path, result_image_path, edit_prompt_json):
+def call_gpt(original_image_path, result_image_path, edit_prompt_json, client, model_name):
     try:
         # Read editing instructions from JSON file
         with open(edit_prompt_json, 'r') as f:
@@ -72,11 +62,9 @@ def call_gpt(original_image_path, result_image_path, edit_prompt_json):
         if not original_image_base64 or not result_image_base64:
             return {"error": "Image conversion failed"}
 
-        
-
         # API request for evaluating image edit
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=model_name,
             stream=False,
             messages=[{
                 "role": "user",
@@ -100,64 +88,59 @@ def call_gpt(original_image_path, result_image_path, edit_prompt_json):
         return response
 
     except Exception as e:
-        print(f"Error in calling GPT API: {e}")
-        raise  
+        print(f"Error in calling vLLM API: {e}")
+        raise
 
-def process_folder(folder, api_key):
+def process_folder(args):
+    folder, base_url, api_key, model_name = args
+    # 在每个进程中创建client，因为client对象不能被pickle
+    client = OpenAI(api_key=api_key, base_url=base_url)
     original_png = os.path.join(folder, 'original.png')
     result_png = os.path.join(folder, 'result.png')
     result_json = os.path.join(folder, 'result.json')
     judge_json = os.path.join(folder, 'judge_2scores.json')
 
     if os.path.exists(judge_json):
-        print(f"Judge file has been existed")
         return
 
     # Check if required files exist
     if os.path.exists(original_png) and os.path.exists(result_png) and os.path.exists(result_json):
-        response = call_gpt(original_png, result_png, result_json, api_key)
+        try:
+            response = call_gpt(original_png, result_png, result_json, client, model_name)
 
-        judge_dict = {}
-        judge_dict['score'] = response.choices[0].message.content
+            judge_dict = {}
+            judge_dict['score'] = response.choices[0].message.content
 
-        # Save the response to judge.json
-        with open(judge_json, 'w') as f:
-            json.dump(judge_dict, f, indent=4)
+            # Save the response to judge.json
+            with open(judge_json, 'w') as f:
+                json.dump(judge_dict, f, indent=4)
+        except Exception as e:
+            print(f"Error processing folder {folder}: {e}")
     else:
         print(f"Some files are missing in {folder}")
 
-# Function to process the directory in parallel without lambda
-def process_folder_with_api_key(args):
-    folder, api_key = args
-    process_folder(folder, api_key)
-
-def process_directory_parallel(parent_folder, num_processes, api_key):
+def process_directory_parallel(parent_folder, num_processes, base_url, api_key, model_name):
     # List all subfolders
     subfolders = [os.path.join(parent_folder, subfolder) for subfolder in os.listdir(parent_folder) if os.path.isdir(os.path.join(parent_folder, subfolder))]
-    
-    # Use multiprocessing with tqdm to show progress
-    with Pool(num_processes) as pool:
-        list(tqdm(pool.imap(process_folder_with_api_key, [(folder, api_key) for folder in subfolders]), total=len(subfolders), desc="Processing Folders"))
 
-def process_directory(parent_folder, api_key):
-    # Get a list of all subfolders in the parent directory
-    subfolders = [os.path.join(parent_folder, subfolder) for subfolder in os.listdir(parent_folder) if os.path.isdir(os.path.join(parent_folder, subfolder))]
-    
-    # Use tqdm to show a progress bar for processing subfolders
-    for folder in tqdm(subfolders, desc="Processing Subfolders"):
-        process_folder(folder, api_key)
+    # Use multiprocessing with tqdm to show progress
+    params = [(folder, base_url, api_key, model_name) for folder in subfolders]
+    with Pool(num_processes) as pool:
+        list(tqdm(pool.imap(process_folder, params), total=len(subfolders), desc="Processing Folders"))
 
 # Main function to handle argument parsing and initiate processing
 def main():
     parser = argparse.ArgumentParser(description="Process image editing tasks in a directory")
     parser.add_argument('--parent_folder', type=str, default="/mnt/workspace/inpaint", help="Path to the parent folder containing subfolders with image editing pairs")
-    parser.add_argument('--num_processes', type=int, default=96, help="Number of processes to use for parallel processing (default: 4)")
-    parser.add_argument('--api_key', type=str, required=True, help="API key for OpenAI")
+    parser.add_argument('--num_processes', type=int, default=96, help="Number of processes to use for parallel processing (default: 96)")
+    parser.add_argument('--base_url', type=str, default="http://localhost:8000/v1", help="vLLM service base URL")
+    parser.add_argument('--api_key', type=str, default="EMPTY", help="API key for vLLM service (default: EMPTY)")
+    parser.add_argument('--model_name', type=str, default="gpt-4o", help="Model name for vLLM service")
 
     args = parser.parse_args()
 
     # Process the directory with the specified number of processes
-    process_directory_parallel(args.parent_folder, args.num_processes, args.api_key)
+    process_directory_parallel(args.parent_folder, args.num_processes, args.base_url, args.api_key, args.model_name)
 
 if __name__ == "__main__":
     main()
